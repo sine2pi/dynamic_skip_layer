@@ -43,10 +43,7 @@ class skip_layer(nn.Module):
         super().__init__()
 
         self.logs = []
-
-        self.initial_threshold = initial_threshold
-        self.threshold = nn.Parameter(torch.tensor(initial_threshold, dtype=torch.float32), requires_grad=False) 
-        
+       
         self.ema_loss = torch.tensor(0.0, dtype=torch.float32)
         self.ema_decay = ema_decay
         self.threshold_lr = threshold_lr
@@ -89,22 +86,6 @@ class skip_layer(nn.Module):
 
     def _calculate_shared_attention(self, x, mask=None):
         return self.attention(x, xa=x, mask=mask)
-
-    def predict_choice(self, pooled_rep, layer_idx):
-        choice_scores = self.predict[layer_idx](pooled_rep)
-        return choice_scores
-
-    def update_threshold(self, current_batch_loss):
-        with torch.no_grad():
-            if self.ema_loss.item() == 0.0:
-                self.ema_loss.copy_(current_batch_loss)
-            else:
-                self.ema_loss.mul_(self.ema_decay).add_(current_batch_loss * (1 - self.ema_decay))
-            if current_batch_loss > self.ema_loss:
-                self.threshold.sub_(self.threshold_lr)
-            else:
-                self.threshold.add_(self.threshold_lr)
-            self.threshold.data = torch.clamp(self.threshold.data, 0.0, 1.0)
 
     def forward(self, x, xa=None, mask=None):
         batch, ctx, _ = x.shape

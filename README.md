@@ -124,6 +124,9 @@ class skip_layer(nn.Module):
             else:
                 action = 0
 
+#             jump_prob = policy[:, 1] if i < self.layer - 1 else torch.zeros_like(policy[:, 1])
+#             jump = (torch.rand_like(jump_prob) < jump_prob).any()
+
             jump_distance = 0
             if action == 1: jump_distance = 1
             if action == 2: jump_distance = 2

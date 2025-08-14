@@ -5,10 +5,10 @@
     
     self.jmp = skip_layer(dims, head, layer) # in your init
     
-    x = self.jmp(x) # in your forward. Ideally upstream of your attention unless you want that attention to not be effected by the layer skipping. You could set it after and grab the output        of the downstream attention. That would allow you to skip layers based on last pass which might be interesting. 
+    x = self.jmp(x) # in your forward. Ideally upstream of your attention unless you want that attention to not be effected by the layer skipping. You could set it after and grab the output      of the downstream attention. That would allow you to skip layers based on last pass which might be interesting. 
     
-     self.processor.jmp.update_threshold(loss=loss.item()) # in your forward model (or something similar) if you want the threshold for layer jumping to change based on loss -outside- the 
-     graph otherwise omit and it will adjust on gradients as usual
+    self.processor.jmp.update_threshold(loss=loss.item()) # in your forward model if you want the threshold for layer jumping to change based on loss -outside- the graph otherwise omit and i
+    t will adjust on gradients as usual
 
     self.logs = {'jumps': history} # at the end of the block the layers skipped are captures for review or you can print them to screen during training to observe the layers the model is         skippiong and how often. It takes a bit of time to tune.
     

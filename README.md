@@ -4,6 +4,8 @@
     # usage:
     self.jmp = skip_layer(dims, head, layer) # in your init
     x = self.jmp(x) # in your forward. Ideally upstream of your attention unless you want that attention to not be effected by the layer skipping.
+     self.processor.jmp.update_threshold(loss=loss.item()) # in your forward (or something similar) if you want the threshold for layer jumping to change based on loss -outside- the graph otherwise omit and it will adjust on gradients as usual
+    
 ```python
 class mgate(nn.Module):
     def __init__(self, dims, mem=64, thresh=0.5):

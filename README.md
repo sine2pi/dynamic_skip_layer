@@ -1,4 +1,5 @@
-
+The skip_layer module processes input features x through an iterative loop. In each iteration, mgate determines whether the current layer's core transformations (ln, adapter, and the MiniHyperConnection) should be applied or bypassed. If the layer is activated, the features are processed through the MiniHC module, which creates multiple parallel representations and dynamically combines them based on learned weights. This dynamically weighted output is then gated and added to the main feature x, allowing for a flexible and adaptive integration of information.
+The policy_net determines whether to jump ahead to a later layer, further accelerating the processing based on the input context. When a jump occurs, information from work_mem (which accumulates features from previously processed layers) is incorporated, enabling a form of long-range skip connection with accumulated context.  And it kind of works..
 
         
     # Example Usage

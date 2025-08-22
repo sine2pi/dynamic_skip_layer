@@ -1,35 +1,47 @@
 
 
+        
+    # Example Usage
     
-    # usage:
+    tokens = 10000
+    mels = 80
+    ctx = 512
+    dims = 512
+    head = 8 # Not used directly in skip_layer's core logic here, but might be used by internal layers
+    layer = 6 # Number of skip_layers
+    act = nn.ReLU() # Placeholder for activation
     
-    self.jmp = skip_layer(dims, head, layer) # in your init
+    batch_size = 4
+    seq_len = 128
     
-    x = self.jmp(x) # in your forward. Ideally upstream of your attention unless you want that attention to not be effected by the layer skipping. You could set it after and grab the output      of the downstream attention. That would allow you to skip layers based on last pass which might be interesting. 
+    dummy_x = torch.randint(0, tokens, (batch_size, seq_len)).to(device)
+    dummy_xa = torch.randn(batch_size, seq_len, dims).to(device) # Assuming xa has the same sequence length as x
     
-    self.processor.jmp.update_threshold(loss=loss.item()) # in your forward model if you want the threshold for layer jumping to change based on loss -outside- the graph otherwise omit and i
-    t will adjust on gradients as usual
+    # Instantiate with mini Hyper-Connections
+    model_with_mini_hc = skip_layer(dims, head, layer, mini_hc=True, hc_expansion_rate=3).to(device)
+    output_mini_hc = model_with_mini_hc(dummy_xa) # Using dummy_xa as the primary input for forward pass in this simplified skip_layer
+    print("\nOutput with mini Hyper-Connections:", output_mini_hc.shape)
+    
+    # Instantiate without mini Hyper-Connections
+    model_without_mini_hc = skip_layer(dims, head, layer, mini_hc=False).to(device)
+    output_without_mini_hc = model_without_mini_hc(dummy_xa)
+    print("Output without mini Hyper-Connections:", output_without_mini_hc.shape)
 
-    self.logs = {'jumps': history} # at the end of the block the layers skipped are captures for review or you can print them to screen during training to observe the layers the model is         skippiong and how often. It takes a bit of time to tune.
+
     
 ```python
-class mgate(nn.Module):
-    def __init__(self, dims, mem=64, thresh=0.5):
-        super().__init__()
-        self.mkey = nn.Parameter(torch.randn(mem, dims))
-        self.mval = nn.Parameter(torch.randn(mem, 1))
-        self.mlp = nn.Sequential(nn.Linear(dims, dims//2), nn.SiLU(), nn.Linear(dims//2, 1))
-        self.threshold = nn.Parameter(torch.tensor(thresh, dtype=torch.float32), requires_grad=False)
-        self.concat = nn.Linear(2,1, device=device, dtype=dtype)
 
-    def forward(self, x):
-        key = F.softmax(torch.matmul(F.normalize(x, p=2, dim=-1), F.normalize(self.mkey, p=2, dim=-1).transpose(0, 1)) / math.sqrt(x.shape[-1]), dim=-1)
-        x = self.concat(torch.cat((torch.matmul(key, self.mval),  self.mlp(x)), dim=-1))
-       
-        threshold = apply_ste_threshold(x, self.threshold)
-        return threshold, x
 
-class StraightThroughThreshold(torch.autograd.Function):
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import numpy as np
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+dtype = torch.float32
+
+class STthreshold(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, threshold):
         binary_output = (x > threshold).float()
@@ -43,10 +55,42 @@ class StraightThroughThreshold(torch.autograd.Function):
         grad_threshold = None
         return grad_x, grad_threshold
 
-apply_ste_threshold = StraightThroughThreshold.apply
+apply_ste = STthreshold.apply
+
+class mgate(nn.Module):
+    def __init__(self, dims, mem=64, thresh=0.5):
+        super().__init__()
+        self.mkey = nn.Parameter(torch.randn(mem, dims))
+        self.mval = nn.Parameter(torch.randn(mem, 1))
+        self.mlp = nn.Sequential(nn.Linear(dims, dims//2), nn.SiLU(), nn.Linear(dims//2, 1))
+        self.threshold = nn.Parameter(torch.tensor(thresh, dtype=torch.float32), requires_grad=False)
+        self.concat = nn.Linear(2,1, device=device, dtype=dtype)
+
+    def forward(self, x):
+        key = F.softmax(torch.matmul(F.normalize(x, p=2, dim=-1), F.normalize(self.mkey, p=2, dim=-1).transpose(0, 1)) / math.sqrt(x.shape[-1]), dim=-1)
+        x = self.concat(torch.cat((torch.matmul(key, self.mval),  self.mlp(x)), dim=-1))
+       
+        threshold = apply_ste(x, self.threshold)
+        return threshold, x
+
+class MiniConnection(nn.Module):
+    def __init__(self, dims, expand=2):
+        super().__init__()
+        self.dims = dims
+        self.expand = expand
+        self.parallel = nn.ModuleList([nn.Linear(dims, dims) for _ in range(expand)])
+        self.network = nn.Linear(dims, expand)
+        self.relu = nn.ReLU()
+
+    def forward(self, input_features):
+        features = [pathway(input_features) for pathway in self.parallel]
+        weights = torch.softmax(self.network(input_features), dim=-1)
+        weighted_combined = sum(w * f for w, f in zip(weights.unbind(dim=-1), features))
+        return self.relu(weighted_combined)
+
 
 class skip_layer(nn.Module):
-    def __init__(self, dims, head, layer):
+    def __init__(self, dims, head, layer, mini_hc=True, hc_expansion_rate=2):
         super().__init__()
 
         self.work_mem = nn.Parameter(torch.zeros(1, 1, dims), requires_grad=True)
@@ -57,23 +101,29 @@ class skip_layer(nn.Module):
   
         self.layers = nn.ModuleList()
         for i in range(layer):
-            self.layers.append(nn.ModuleDict({
+            layer_dict = {
                 'ln': nn.LayerNorm(dims),
                 'gate': nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid()),
                 'adapter': nn.Linear(dims, dims) if i % 2 == 0 else None,
                 'mgate': mgate(dims, mem=64),
-                }))
+            }
+            if mini_hc:
+                layer_dict['mini_hc'] = MiniConnection(dims, expand=hc_expansion_rate)
+            else:
+                layer_dict['mini_hc'] = None
 
-        self.mgate= mgate(dims, mem=64)
+            self.layers.append(nn.ModuleDict(layer_dict))
+
+        self.mgate = mgate(dims, mem=64)
         self.policy_net = nn.Sequential(
             nn.Linear(dims, 128),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(128, 3))
 
         self.mlp_gate = nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid())
-        self.mlp = nn.Sequential(nn.Linear(dims, dims * 4), nn.GELU(), nn.Linear(dims * 4, dims))
+        self.mlp = nn.Sequential(nn.Linear(dims, dims * 4), nn.SiLU(), nn.Linear(dims * 4, dims))
         self.mlp_ln = nn.LayerNorm(dims)
- 
+
     def update_threshold(self, loss, lr=0.01):
         if loss > self.loss:
             self.mgate.threshold.sub_(lr)
@@ -81,7 +131,7 @@ class skip_layer(nn.Module):
            self.mgate.threshold.add_(lr)
         self.mgate.threshold.data = torch.clamp(self.mgate.threshold.data, 0.0, 1.0)
 
-    def forward(self, x, xa=None): 
+    def forward(self, x, xa=None, mask=None): 
         batch, ctx = x.shape[:2]
         ox = x
         work_mem = self.work_mem.expand(batch, -1, -1)
@@ -94,22 +144,37 @@ class skip_layer(nn.Module):
         i = 0
         while i < self.layer:
             layer = self.layers[i]
-            # scalar = self.layer_choice(x, i)
+            
             scalar, choice = layer['mgate'](x)
-            mask = scalar.expand(-1, ctx, -1) 
+            mask_layer = scalar.expand(-1, ctx, -1)
             x2 = torch.zeros_like(x)
             skip = (scalar == 0).squeeze(-1)
             x2[skip] = x[skip].clone().detach() 
 
             px = layer['ln'](x2)  
-            if layer['adapter'] is not None:
-                attn = layer['adapter'](px)
-            gate_val = layer['gate'](px)
-            x = x + gate_val * (attn * mask)
+
+            if layer['mini_hc'] is not None:
+                if layer['adapter'] is not None:
+                    adapted_px = layer['adapter'](px)
+                else:
+                    adapted_px = px
+                
+                hc_output = layer['mini_hc'](adapted_px)
+                
+                gate_val = layer['gate'](px)
+                x = x + gate_val * (hc_output * mask_layer)
+            else:
+                if layer['adapter'] is not None:
+                    attn = layer['adapter'](px)
+                else:
+                    attn = px
+                gate_val = layer['gate'](px)
+                x = x + gate_val * (attn * mask_layer)
 
             mem = x.mean(dim=1, keepdim=True)
             mem_val = self.mem_gate(mem)
             work_mem = mem_val * work_mem + (1 - mem_val) * mem
+            
             if i < self.layer - 1:
                 action = torch.multinomial(policy, 1).squeeze(1).item()
             else:
@@ -131,4 +196,5 @@ class skip_layer(nn.Module):
         x = x + x3 * output
         self.logs = {'jumps': history}
         return x
+
 ```

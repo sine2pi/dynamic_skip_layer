@@ -58,7 +58,7 @@ class STthreshold(torch.autograd.Function):
 
 apply_ste = STthreshold.apply
 
-class mgate(nn.Module):
+class mgate(nn.Module): # need to rethink this .. something simple and clever. simple. and.. clever.... ..
     def __init__(self, dims, mem=64, thresh=0.5):
         super().__init__()
         self.mkey = nn.Parameter(torch.randn(mem, dims))

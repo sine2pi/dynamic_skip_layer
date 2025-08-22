@@ -1,32 +1,6 @@
 The skip_layer module processes input features x through an iterative loop. In each iteration, mgate determines whether the current layer's core transformations (ln, adapter, and the MiniHyperConnection) should be applied or bypassed. If the layer is activated, the features are processed through the MiniHC module, which creates multiple parallel representations and dynamically combines them based on learned weights. This dynamically weighted output is then gated and added to the main feature x, allowing for a flexible and adaptive integration of information.
 The policy_net determines whether to jump ahead to a later layer, further accelerating the processing based on the input context. When a jump occurs, information from work_mem (which accumulates features from previously processed layers) is incorporated, enabling a form of long-range skip connection with accumulated context.  And it kind of works..
 
-        
-    # Example Usage
-    
-    tokens = 10000
-    mels = 80
-    ctx = 512
-    dims = 512
-    head = 8 # Not used directly in skip_layer's core logic here, but might be used by internal layers
-    layer = 6 # Number of skip_layers
-    act = nn.ReLU() # Placeholder for activation
-    
-    batch_size = 4
-    seq_len = 128
-    
-    dummy_x = torch.randint(0, tokens, (batch_size, seq_len)).to(device)
-    dummy_xa = torch.randn(batch_size, seq_len, dims).to(device) # Assuming xa has the same sequence length as x
-    
-    # Instantiate with mini Hyper-Connections
-    model_with_mini_hc = skip_layer(dims, head, layer, mini_hc=True, hc_expansion_rate=3).to(device)
-    output_mini_hc = model_with_mini_hc(dummy_xa) # Using dummy_xa as the primary input for forward pass in this simplified skip_layer
-    print("\nOutput with mini Hyper-Connections:", output_mini_hc.shape)
-    
-    # Instantiate without mini Hyper-Connections
-    model_without_mini_hc = skip_layer(dims, head, layer, mini_hc=False).to(device)
-    output_without_mini_hc = model_without_mini_hc(dummy_xa)
-    print("Output without mini Hyper-Connections:", output_without_mini_hc.shape)
 
 
     

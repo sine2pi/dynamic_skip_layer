@@ -1,9 +1,28 @@
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import numpy as np
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+dtype = torch.float32
 
-# usage:
-self.jmp = skip_layer(dims, head, layer) # in your init
-x = self.jmp(x) # in your forward. Ideally upstream of your attention unless you want that attention to not be effected by the layer skipping.
+class STthreshold(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, threshold):
+        binary_output = (x > threshold).float()
+        ctx.save_for_backward(x)
+        return binary_output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, = ctx.saved_tensors
+        grad_x = grad_output.clone()
+        grad_threshold = None
+        return grad_x, grad_threshold
+
+apply_ste = STthreshold.apply
 
 class mgate(nn.Module):
     def __init__(self, dims, mem=64, thresh=0.5):
@@ -18,27 +37,27 @@ class mgate(nn.Module):
         key = F.softmax(torch.matmul(F.normalize(x, p=2, dim=-1), F.normalize(self.mkey, p=2, dim=-1).transpose(0, 1)) / math.sqrt(x.shape[-1]), dim=-1)
         x = self.concat(torch.cat((torch.matmul(key, self.mval),  self.mlp(x)), dim=-1))
        
-        threshold = apply_ste_threshold(x, self.threshold)
+        threshold = apply_ste(x, self.threshold)
         return threshold, x
 
-class StraightThroughThreshold(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, threshold):
-        binary_output = (x > threshold).float()
-        ctx.save_for_backward(x)
-        return binary_output
+class MiniConnection(nn.Module):
+    def __init__(self, dims, expand=2):
+        super().__init__()
+        self.dims = dims
+        self.expand = expand
+        self.parallel = nn.ModuleList([nn.Linear(dims, dims) for _ in range(expand)])
+        self.network = nn.Linear(dims, expand)
+        self.relu = nn.ReLU()
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        x, = ctx.saved_tensors
-        grad_x = grad_output.clone()
-        grad_threshold = None
-        return grad_x, grad_threshold
+    def forward(self, input_features):
+        features = [pathway(input_features) for pathway in self.parallel]
+        weights = torch.softmax(self.network(input_features), dim=-1)
+        weighted_combined = sum(w * f for w, f in zip(weights.unbind(dim=-1), features))
+        return self.relu(weighted_combined)
 
-apply_ste_threshold = StraightThroughThreshold.apply
 
 class skip_layer(nn.Module):
-    def __init__(self, dims, head, layer):
+    def __init__(self, dims, head, layer, mini_hc=True, hc_expansion_rate=2):
         super().__init__()
 
         self.work_mem = nn.Parameter(torch.zeros(1, 1, dims), requires_grad=True)
@@ -49,23 +68,29 @@ class skip_layer(nn.Module):
   
         self.layers = nn.ModuleList()
         for i in range(layer):
-            self.layers.append(nn.ModuleDict({
+            layer_dict = {
                 'ln': nn.LayerNorm(dims),
                 'gate': nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid()),
                 'adapter': nn.Linear(dims, dims) if i % 2 == 0 else None,
                 'mgate': mgate(dims, mem=64),
-                }))
+            }
+            if mini_hc:
+                layer_dict['mini_hc'] = MiniConnection(dims, expand=hc_expansion_rate)
+            else:
+                layer_dict['mini_hc'] = None
 
-        self.mgate= mgate(dims, mem=64)
+            self.layers.append(nn.ModuleDict(layer_dict))
+
+        self.mgate = mgate(dims, mem=64)
         self.policy_net = nn.Sequential(
             nn.Linear(dims, 128),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(128, 3))
 
         self.mlp_gate = nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid())
-        self.mlp = nn.Sequential(nn.Linear(dims, dims * 4), nn.GELU(), nn.Linear(dims * 4, dims))
+        self.mlp = nn.Sequential(nn.Linear(dims, dims * 4), nn.SiLU(), nn.Linear(dims * 4, dims))
         self.mlp_ln = nn.LayerNorm(dims)
- 
+
     def update_threshold(self, loss, lr=0.01):
         if loss > self.loss:
             self.mgate.threshold.sub_(lr)
@@ -73,7 +98,7 @@ class skip_layer(nn.Module):
            self.mgate.threshold.add_(lr)
         self.mgate.threshold.data = torch.clamp(self.mgate.threshold.data, 0.0, 1.0)
 
-    def forward(self, x, xa=None): 
+    def forward(self, x, xa=None, mask=None): 
         batch, ctx = x.shape[:2]
         ox = x
         work_mem = self.work_mem.expand(batch, -1, -1)
@@ -86,22 +111,37 @@ class skip_layer(nn.Module):
         i = 0
         while i < self.layer:
             layer = self.layers[i]
-            # scalar = self.layer_choice(x, i)
+            
             scalar, choice = layer['mgate'](x)
-            mask = scalar.expand(-1, ctx, -1) 
+            mask_layer = scalar.expand(-1, ctx, -1)
             x2 = torch.zeros_like(x)
             skip = (scalar == 0).squeeze(-1)
             x2[skip] = x[skip].clone().detach() 
 
             px = layer['ln'](x2)  
-            if layer['adapter'] is not None:
-                attn = layer['adapter'](px)
-            gate_val = layer['gate'](px)
-            x = x + gate_val * (attn * mask)
+
+            if layer['mini_hc'] is not None:
+                if layer['adapter'] is not None:
+                    adapted_px = layer['adapter'](px)
+                else:
+                    adapted_px = px
+                
+                hc_output = layer['mini_hc'](adapted_px)
+                
+                gate_val = layer['gate'](px)
+                x = x + gate_val * (hc_output * mask_layer)
+            else:
+                if layer['adapter'] is not None:
+                    attn = layer['adapter'](px)
+                else:
+                    attn = px
+                gate_val = layer['gate'](px)
+                x = x + gate_val * (attn * mask_layer)
 
             mem = x.mean(dim=1, keepdim=True)
             mem_val = self.mem_gate(mem)
             work_mem = mem_val * work_mem + (1 - mem_val) * mem
+            
             if i < self.layer - 1:
                 action = torch.multinomial(policy, 1).squeeze(1).item()
             else:
